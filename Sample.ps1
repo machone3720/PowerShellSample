@@ -66,7 +66,13 @@ function Get-AppCredential {
         [string] $Lane,
 
         [Parameter()]
-        [switch] $Secondary
+        [switch] $Secondary,
+
+        [Parameter()]
+        [int] $RetryCount = 3,
+
+        [Parameter()]
+        [int] $RetryDelaySeconds = 2
     )
 <#
 .SYNOPSIS
@@ -75,7 +81,8 @@ Builds a PSCredential from your obfuscated secrets store (Get-BankDeets).
 .DESCRIPTION
 Wraps your existing Get-BankDeets workflow. It reads the appropriate UPN
 (PrimaryUPN/SecondaryUPN) from $Corp/$Corp2/$Corp3 and converts the returned
-password into a SecureString for a PSCredential.
+password into a SecureString for a PSCredential. Includes retry logic for
+network file access resilience.
 
 .PARAMETER Lane
 Which lane to use (Corp, Corp2, Corp3).
@@ -83,21 +90,56 @@ Which lane to use (Corp, Corp2, Corp3).
 .PARAMETER Secondary
 Use SecondaryUPN instead of PrimaryUPN.
 
+.PARAMETER RetryCount
+Number of retry attempts for Get-BankDeets (default: 3).
+
+.PARAMETER RetryDelaySeconds
+Delay between retry attempts in seconds (default: 2).
+
 .EXAMPLE
 $cred = Get-AppCredential -Lane Corp
 
 .EXAMPLE
 $cred = Get-AppCredential -Lane Corp2 -Secondary
+
+.EXAMPLE
+$cred = Get-AppCredential -Lane Corp -RetryCount 5 -RetryDelaySeconds 3
 #>
-    # Populate $Corp/$Corp2/$Corp3 objects (per your environment)
-    $null = Get-BankDeets
+    # Populate $Corp/$Corp2/$Corp3 objects with retry logic
+    for ($i = 1; $i -le $RetryCount; $i++) {
+        try {
+            $null = Get-BankDeets
+            break
+        }
+        catch {
+            if ($i -eq $RetryCount) {
+                throw "Failed to populate lane objects after $RetryCount attempts: $($_.Exception.Message)"
+            }
+            Write-Verbose "Retry $i/$RetryCount: Failed to populate lane objects, retrying in $RetryDelaySeconds seconds..."
+            Start-Sleep -Seconds $RetryDelaySeconds
+        }
+    }
 
     $laneObj = Get-Variable -Name $Lane -ErrorAction Stop | Select-Object -ExpandProperty Value
     $upn = if ($Secondary.IsPresent) { $laneObj.SecondaryUPN } else { $laneObj.PrimaryUPN }
 
-    # Get plaintext (your function returns it); convert to SecureString
-    $plain = Get-BankDeets -Lane $Lane
-    if (-not $plain) { throw "No password returned from Get-BankDeets for lane '$Lane'." }
+    # Get plaintext with retry logic
+    $plain = $null
+    for ($i = 1; $i -le $RetryCount; $i++) {
+        try {
+            $plain = Get-BankDeets -Lane $Lane
+            if ($plain) { break }
+        }
+        catch {
+            if ($i -eq $RetryCount) {
+                throw "Failed to retrieve credentials after $RetryCount attempts: $($_.Exception.Message)"
+            }
+            Write-Verbose "Retry $i/$RetryCount: Failed to retrieve credentials for lane '$Lane', retrying in $RetryDelaySeconds seconds..."
+            Start-Sleep -Seconds $RetryDelaySeconds
+        }
+    }
+
+    if (-not $plain) { throw "No password returned from Get-BankDeets for lane '$Lane' after $RetryCount attempts." }
     $secure = ConvertTo-SecureString -String $plain -AsPlainText -Force
 
     return New-Object System.Management.Automation.PSCredential($upn, $secure)
